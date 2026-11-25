@@ -545,6 +545,13 @@ ol.bsteps{margin:6px 0 0;padding-left:18px}ol.bsteps li{margin-bottom:5px}
     <div class="f"><label>OpenRouter API Key <em>(from openrouter.ai/keys)</em></label><input id="setOrKey" type="password" placeholder="sk-or-v1-..." autocomplete="off"></div>
     <div class="f"><label>Model <em>(free by default; any OpenRouter model slug works)</em></label><input id="setOrModel" type="text" list="orModels" placeholder="openrouter/free">
       <datalist id="orModels"><option value="openrouter/free">Free Models Router (picks a free model)</option><option value="nvidia/nemotron-3-super-120b-a12b:free">NVIDIA Nemotron 3 Super (free)</option></datalist></div>
+    <div class="f"><label>Backup Models <em>(tried in order when the first is busy; comma-separated; keep them :free to stay at $0)</em></label><input id="setOrBackups" type="text" placeholder="nvidia/nemotron-3-super-120b-a12b:free, openrouter/free"></div>
+    <div class="row2">
+      <div class="f"><label>Wait for the AI <em>(resets while it is still thinking or writing)</em></label><select id="setOrWait">
+        <option value="90">Stop if silent for 90 seconds</option><option value="180">Stop if silent for 3 minutes</option><option value="300">Stop if silent for 5 minutes</option><option value="0">Never stop (wait as long as it takes)</option></select></div>
+      <div class="f"><label>Model Thinking <em>(less = faster answers)</em></label><select id="setOrThinking">
+        <option value="low">Light (fastest, recommended)</option><option value="medium">Medium</option><option value="default">Model default (slowest)</option></select></div>
+    </div>
     <div class="row2">
       <div class="f"><label>Live Web Search</label><select id="setSearchProvider" onchange="searchFieldsUI()">
         <option value="tavily">Tavily — free, 1,000 searches/month, no card</option>
@@ -741,7 +748,7 @@ const MIXES = {
   static:['static','carousel','static','reel','referral','static']
 };
 const DEFAULT_SETTINGS = {
-  provider:'openrouter', orKey:'', orModel:'openrouter/free', searchProvider:'tavily', tavilyKey:'', jinaKey:'', depth:5,
+  provider:'openrouter', orKey:'', orModel:'openrouter/free', orBackups:'nvidia/nemotron-3-super-120b-a12b:free', orWait:180, orThinking:'low', searchProvider:'tavily', tavilyKey:'', jinaKey:'', depth:5,
   remember:false, website:'www.evermediamarketing.com', email:'inquiries@evermediamarketing.com', booking:'',
   pricing:JSON.parse(JSON.stringify(DEFAULT_PRICING)), pricingV:3, callDays:'2,4', banned:'elevate, unlock, seamless, bespoke, curate, holistic, transform, game-changer, comprehensive, tailored, cutting-edge, leverage, synergy'
 };
@@ -1481,32 +1488,91 @@ async function callOpenRouter({ system, prompt, search, maxTokens, found }){
   if (/^https?:/.test(location.origin)) headers['HTTP-Referer'] = location.origin;
   const useSearch = !!(search && settings.searchProvider === 'openrouter');
   const build = (withSearch, withMax) => {
-    const body = { model:settings.orModel || DEFAULT_SETTINGS.orModel, messages:[{ role:'system', content:system }, { role:'user', content:prompt }] };
+    const primary = settings.orModel || DEFAULT_SETTINGS.orModel, backups = String(settings.orBackups || '').split(',').map(x => x.trim()).filter(x => x && x !== primary);
+    const body = { model:primary, messages:[{ role:'system', content:system }, { role:'user', content:prompt }] };
+    if (backups.length) body.models = [primary].concat(backups).slice(0, 4);
+    const eff = effortOverride || settings.orThinking || 'low';
+    if (withReasoning && eff !== 'default') body.reasoning = { effort:eff, exclude:true };
     if (withMax) body.max_tokens = maxTokens;
     if (withSearch) body.plugins = [{ id:'web', max_results:clamp(+settings.depth || 8, 1, 20) }];
     return body;
   };
   let withSearch = useSearch, withMax = true, searchSkipped = search && settings.searchProvider === 'off' ? 'Live web search is off in Settings' : '';
-  for (let attempt = 0; attempt < 3; attempt++){
-    progressNote((found != null ? found + ' web sources found; ' : withSearch ? 'searching the web and ' : '') + 'waiting for ' + (settings.orModel || 'openrouter/free') + ' to write (up to 90 s)');
-    const r = await fetchRetry(OPENROUTER_URL, { method:'POST', headers, body:JSON.stringify(build(withSearch, withMax)) });
-    const data = await r.json().catch(() => ({}));
+  let busyWaits = 0, withReasoning = true, effortOverride = '';
+  for (let attempt = 0; attempt < 6; attempt++){
+    progressNote((found != null ? found + ' web sources found; ' : withSearch ? 'searching the web and ' : '') + 'waiting for ' + (settings.orModel || 'openrouter/free') + ' to respond');
+    const { r, data } = await orStream(build(withSearch, withMax), headers);
     const msg = (data.error && (data.error.message || (data.error.metadata && data.error.metadata.raw))) || '';
     if (!r.ok || data.error){
       if (withSearch && (r.status === 402 || /credit|plugin|web|search|payment|insufficient/i.test(msg))){ withSearch = false; searchSkipped = 'Live web search unavailable (' + (msg || 'status ' + r.status) + ')'; continue; }
+      if (withReasoning && r.status === 400 && /reason|effort/i.test(msg)){ withReasoning = false; continue; }
       if (withMax && r.status === 400 && /max_tokens|token|context/i.test(msg)){ withMax = false; continue; }
       if (r.status === 401) throw new Error('OpenRouter rejected the API key. Check it in Settings.');
-      if (r.status === 429) throw new Error('OpenRouter rate limit reached (free models allow a limited number of requests per minute and day). Wait a minute or add credits.');
+      if (r.status === 429 || (r.status >= 500 && r.status !== 501)){
+        const daily = /per[- ]day|daily/i.test(msg);
+        if (daily) throw new Error('You have used today\'s free OpenRouter requests (50 a day; 1,000 a day once you have bought $10 of credits). Try again tomorrow, add credits, or pick a paid model in Settings.');
+        if (busyWaits < 3){
+          const ra = parseInt(r.headers.get('retry-after'), 10), wait = clamp(isNaN(ra) ? 15 * (busyWaits + 1) : ra, 5, 60);
+          busyWaits++;
+          for (let left = wait; left > 0; left--){ progressNote('the free model is busy right now (' + (r.status === 429 ? 'rate limited' : 'error ' + r.status) + '); retrying in ' + left + ' s, try ' + (busyWaits + 1) + ' of 4'); await new Promise(z => setTimeout(z, 1000)); }
+          continue;
+        }
+        throw new Error('The free models stayed busy after 3 retries (' + (msg || 'rate limited') + '). Free models share capacity with everyone on OpenRouter: wait a few minutes, add a backup model in Settings, or use a paid model.');
+      }
       throw new Error(msg || ('OpenRouter error ' + r.status));
     }
     const m = ((data.choices || [])[0] || {}).message || {};
     const text = typeof m.content === 'string' ? m.content : (Array.isArray(m.content) ? m.content.map(c => c.text || '').join('') : '');
+    if (!text.trim() && ((data.choices || [])[0] || {}).finish_reason === 'length' && effortOverride !== 'minimal' && withReasoning){ effortOverride = 'minimal'; progressNote('the model used its whole budget thinking; asking it again with less thinking'); continue; }
     if (!text.trim()) throw new Error('The model returned an empty answer' + (data.model ? ' (' + data.model + ')' : '') + '. Run it again, or choose another model in Settings.');
     const sources = (m.annotations || []).filter(x => x && x.type === 'url_citation' && x.url_citation).map(x => ({ uri:x.url_citation.url, title:x.url_citation.title || x.url_citation.url }));
     return { text, sources, queries:[], model:data.model || settings.orModel, searchSkipped };
   }
   throw new Error('OpenRouter request failed after retries.');
 }
+/* streamed call: the wait timer resets every time the model sends anything (thinking or text) */
+async function orStream(body, headers){
+  const idleMs = (settings.orWait == null ? 180 : +settings.orWait) * 1000;
+  const ctl = new AbortController(); let timer = null, timedOut = false;
+  const arm = () => { if (!idleMs) return; clearTimeout(timer); timer = setTimeout(() => { timedOut = true; ctl.abort(); }, idleMs); };
+  const idleErr = () => new Error('The model went silent for ' + Math.round(idleMs / 1000) + ' seconds, so the engine stopped waiting. Raise "Wait for the AI" in Settings, set Model Thinking to Light, or try another model.');
+  const fake = (status, error) => ({ r:{ ok:false, status, headers:{ get:() => null } }, data:{ error } });
+  arm();
+  let r;
+  try { r = await fetch(OPENROUTER_URL, { method:'POST', headers, body:JSON.stringify(Object.assign({}, body, { stream:true })), signal:ctl.signal }); }
+  catch(e){ clearTimeout(timer); if (timedOut) throw idleErr(); throw new Error('Network error reaching OpenRouter. Check your connection, or open the engine directly in a browser rather than a preview window.'); }
+  if (!r.ok || !/event-stream/.test(r.headers.get('content-type') || '')){ clearTimeout(timer); const data = await r.json().catch(() => ({})); return { r, data }; }
+  const reader = r.body.getReader(), dec = new TextDecoder(), t0 = Date.now();
+  let buf = '', text = '', thinking = 0, model = '', ann = [], finish = '', err = null, lastNote = 0;
+  try {
+    for (;;){
+      const { value, done } = await reader.read();
+      if (done) break;
+      arm(); buf += dec.decode(value, { stream:true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0){
+        const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        let j; try { j = JSON.parse(payload); } catch(e){ continue; }
+        if (j.error){ err = j.error; continue; }
+        if (j.model) model = j.model;
+        const c = (j.choices || [])[0] || {}, dl = c.delta || c.message || {};
+        if (typeof dl.content === 'string') text += dl.content;
+        if (dl.reasoning) thinking += String(dl.reasoning).length;
+        if (Array.isArray(dl.reasoning_details)) thinking += dl.reasoning_details.length;
+        if (Array.isArray(dl.annotations)) ann = ann.concat(dl.annotations);
+        if (c.finish_reason) finish = c.finish_reason;
+      }
+      if (Date.now() - lastNote > 1000){ lastNote = Date.now(); const sec = Math.round((Date.now() - t0) / 1000); progressNote((model ? model.replace(/^.*\//, '') + ' ' : '') + (text ? 'writing: about ' + text.split(/\s+/).length + ' words so far' : 'thinking (' + sec + ' s)') + ' — the wait resets while it works'); }
+    }
+  } catch(e){ clearTimeout(timer); if (timedOut) throw idleErr(); throw new Error('The connection to OpenRouter dropped mid-answer. Run it again.'); }
+  clearTimeout(timer);
+  if (err) return fake(+err.code || 500, err);
+  return { r, data:{ model, choices:[{ message:{ content:text, annotations:ann }, finish_reason:finish }] } };
+}
+function isFreeModel(){ return /:free$|^openrouter\/free$/.test(settings.orModel || 'openrouter/free'); }
 /* free live search: run the searches here, then hand the results to the OpenRouter model */
 async function searchTavily(q, n){
   const relay = (settings.searchProxy || '').trim(), hd = { 'Content-Type':'application/json' };
@@ -1798,14 +1864,15 @@ async function generate(opts = {}){
       prompts.push('=== CONTENT (example batch) ===\n' + contentPrompt(s, AI.intel, strat, (batches[0] || { items:[] }).items, (batches[0] || {}).kind || ''));
       AI.posts = {};
       let done = 0, failed = 0;
-      await Promise.all(batches.map(async bt => {
+      const runBatch = async bt => {
         try {
           const r = await callLLM({ system:studioSystem(), prompt:contentPrompt(s, AI.intel, strat, bt.items, bt.kind), search:false, maxTokens:12000 });
           const j = extractJSON(r.text);
           (j.posts || []).forEach(p => { if (p && p.id) AI.posts[p.id] = Object.fromEntries(Object.entries(p).filter(([k,v]) => v && k !== 'id')); });
         } catch(e){ failed++; AI.meta.errors.push('Content batch: ' + e.message); }
         done++; upd('c', 'on', done + ' of ' + batches.length + ' batches');
-      }));
+      };
+      if (isFreeModel()){ for (const bt of batches) await runBatch(bt); } else await Promise.all(batches.map(runBatch));
       upd('c', failed ? 'err' : 'done', failed ? failed + ' batch(es) fell back to templates' : Object.keys(AI.posts).length + ' assets written');
     }
   } finally {
@@ -2498,14 +2565,14 @@ function loadSettings(){
 function fillSettings(){
   renderPricingRows();
   $('setRush').value = settings.rushFee || ''; $('setSignOff').value = settings.signOff || '';
-  $('setProvider').value = settings.provider; $('setOrKey').value = settings.orKey || ''; $('setOrModel').value = settings.orModel || DEFAULT_SETTINGS.orModel;
+  $('setProvider').value = settings.provider; $('setOrKey').value = settings.orKey || ''; $('setOrModel').value = settings.orModel || DEFAULT_SETTINGS.orModel; $('setOrWait').value = String(settings.orWait == null ? 180 : settings.orWait); $('setOrThinking').value = settings.orThinking || 'low'; $('setOrBackups').value = settings.orBackups == null ? DEFAULT_SETTINGS.orBackups : settings.orBackups;
   $('setSearchProvider').value = settings.searchProvider || 'tavily'; $('setTavilyKey').value = settings.tavilyKey || ''; $('setSearchProxy').value = settings.searchProxy || ''; $('searchTest').textContent = ''; $('setJinaKey').value = settings.jinaKey || ''; $('setDepth').value = settings.depth; searchFieldsUI();
   $('setRemember').checked = settings.remember; $('setWebsite').value = settings.website; $('setEmail').value = settings.email;
   $('setBooking').value = settings.booking; $('setBanned').value = settings.banned; $('setLens').value = settings.lens || DEFAULT_LENS;
 }
 function saveSettings(){
   settings = Object.assign(settings, {
-    provider:$('setProvider').value, orKey:$('setOrKey').value.trim(), orModel:$('setOrModel').value.trim() || DEFAULT_SETTINGS.orModel, searchProvider:$('setSearchProvider').value, tavilyKey:$('setTavilyKey').value.trim(), searchProxy:$('setSearchProxy').value.trim(), jinaKey:$('setJinaKey').value.trim(), depth:clamp(parseInt($('setDepth').value,10) || 5, 2, 8),
+    provider:$('setProvider').value, orKey:$('setOrKey').value.trim(), orModel:$('setOrModel').value.trim() || DEFAULT_SETTINGS.orModel, orBackups:$('setOrBackups').value.trim(), orWait:parseInt($('setOrWait').value, 10) || 0, orThinking:$('setOrThinking').value, searchProvider:$('setSearchProvider').value, tavilyKey:$('setTavilyKey').value.trim(), searchProxy:$('setSearchProxy').value.trim(), jinaKey:$('setJinaKey').value.trim(), depth:clamp(parseInt($('setDepth').value,10) || 5, 2, 8),
     remember:$('setRemember').checked, website:$('setWebsite').value.trim() || DEFAULT_SETTINGS.website, email:$('setEmail').value.trim() || DEFAULT_SETTINGS.email,
     booking:$('setBooking').value.trim(), rushFee:$('setRush').value.trim(), signOff:$('setSignOff').value.trim(),
     pricing:readPricing(), pricingV:PRICING_V,
